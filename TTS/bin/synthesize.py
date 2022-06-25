@@ -133,6 +133,9 @@ If you don't specify any models, then it uses LJSpeech based English model.
 
     parser.add_argument("--text", type=str, default=None, help="Text to generate speech.")
 
+    parser.add_argument("--text_file_path", type=str, default=None, help="A text file in LJSpeech format to generate speech.")
+    parser.add_argument("--speaker", type=str, default=None, help="Select a specific speaker")
+
     # Args for running pre-trained TTS models.
     parser.add_argument(
         "--model_name",
@@ -161,6 +164,14 @@ If you don't specify any models, then it uses LJSpeech based English model.
         default="tts_output.wav",
         help="Output wav file path.",
     )
+
+    parser.add_argument(
+        "--out_folder",
+        type=str,
+        default="tts_output",
+        help="Output wav files folder.",
+    )
+
     parser.add_argument("--use_cuda", type=bool, help="Run model on CUDA.", default=False)
     parser.add_argument(
         "--vocoder_path",
