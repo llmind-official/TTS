@@ -3,6 +3,7 @@
 
 import argparse
 import sys
+import pandas as pd
 from argparse import RawTextHelpFormatter
 
 # pylint: disable=redefined-outer-name, unused-argument
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from TTS.utils.manage import ModelManager
 from TTS.utils.synthesizer import Synthesizer
+from tqdm.auto import tqdm
 
 
 def str2bool(v):
@@ -133,8 +135,8 @@ If you don't specify any models, then it uses LJSpeech based English model.
 
     parser.add_argument("--text", type=str, default=None, help="Text to generate speech.")
 
-    parser.add_argument("--text_file_path", type=str, default=None, help="A text file in LJSpeech format to generate speech.")
-    parser.add_argument("--speaker", type=str, default=None, help="Select a specific speaker")
+    parser.add_argument("--text_file_path", type=str, default=None, help="A csv file in LJSpeech format ('|' seperated id, text and speaker) to generate speech.")
+    parser.add_argument("--speaker_name_filter", type=str, default=None, help="Filter texts corresponding to a specific speaker in text_file_path ")
 
     # Args for running pre-trained TTS models.
     parser.add_argument(
@@ -354,8 +356,31 @@ If you don't specify any models, then it uses LJSpeech based English model.
         return
 
     # RUN THE SYNTHESIS
+    if args.text_file_path:
+        df = pd.read_csv(args.text_file_path, sep='|', names=['id', 'text', 'speaker_name'])
+
+        if args.speaker_name_filter:
+            df = df[df['speaker_name']==args.speaker_name_filter]
+
+        for idx, row in tqdm(df.iterrows(), total=len(df). desc="Synthesizing"):
+            wav = synthesizer.tts(
+                row['text'],
+                args.speaker_idx,
+                args.language_idx,
+                args.speaker_wav,
+                reference_wav=args.reference_wav,
+                style_wav=args.capacitron_style_wav,
+                style_text=args.capacitron_style_text,
+                reference_speaker_name=args.reference_speaker_idx,
+            )
+            synthesizer.save_wav(wav, f'{args.out_folder}/{row["id"]}.wav')
+        print(" > Saved output wav files in {}".format(args.out_folder))
+
+        return True
+
     if args.text:
         print(" > Text: {}".format(args.text))
+
 
     # kick it
     wav = synthesizer.tts(
