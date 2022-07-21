@@ -244,6 +244,10 @@ class AlignTTS(BaseTTS):
 
     def _forward_decoder(self, o_en, o_en_dp, dr, x_mask, y_lengths, g):
         y_mask = torch.unsqueeze(sequence_mask(y_lengths, None), 1).to(o_en_dp.dtype)
+        # fix extreme predictions  #MYEDITS
+        if hasattr(self, "pos_encoder"):
+            if dr.sum() > self.pos_encoder.max_len:
+                dr = torch.floor(dr * torch.div(self.pos_encoder.max_len, dr.sum()))
         # expand o_en with durations
         o_en_ex, attn = self.expand_encoder_outputs(o_en, dr, x_mask, y_mask)
         # positional encoding
