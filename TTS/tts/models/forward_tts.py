@@ -613,6 +613,43 @@ class ForwardTTS(BaseTTS):
         }
         return outputs
 
+    @torch.no_grad()
+    def inference2(self, x, x_lengths, aux_input={"d_vectors": None, "speaker_ids": None}):  # pylint: disable=unused-argument
+        """Model's inference pass.
+
+        Args:
+            x (torch.LongTensor): Input character sequence.
+            aux_input (Dict): Auxiliary model inputs. Defaults to `{"d_vectors": None, "speaker_ids": None}`.
+
+        Shapes:
+            - x: [B, T_max]
+            - x_lengths: [B]
+            - g: [B, C]
+        """
+        g = self._set_speaker_input(aux_input)
+        #x_lengths = torch.tensor(x.shape[1:2]).to(x.device)
+        x_mask = torch.unsqueeze(sequence_mask(x_lengths, x.shape[1]), 1).to(x.dtype).float()
+        # encoder pass
+        o_en, x_mask, g, _ = self._forward_encoder(x, x_mask, g)
+        # duration predictor pass
+        o_dr_log = self.duration_predictor(o_en, x_mask)
+        o_dr = self.format_durations(o_dr_log, x_mask).squeeze(1)
+        y_lengths = o_dr.sum(1)
+        # pitch predictor pass
+        o_pitch = None
+        if self.args.use_pitch:
+            o_pitch_emb, o_pitch = self._forward_pitch_predictor(o_en, x_mask)
+            o_en = o_en + o_pitch_emb
+        # decoder pass
+        o_de, attn = self._forward_decoder(o_en, o_dr, x_mask, y_lengths, g=None)
+        outputs = {
+            "model_outputs": o_de,
+            "alignments": attn,
+            "pitch": o_pitch,
+            "durations_log": o_dr_log,
+        }
+        return outputs
+
     def train_step(self, batch: dict, criterion: nn.Module):
         text_input = batch["text_input"]
         text_lengths = batch["text_lengths"]
