@@ -357,7 +357,11 @@ If you don't specify any models, then it uses LJSpeech based English model.
 
     # RUN THE SYNTHESIS
     if args.text.endswith('.csv'):
-        df = pd.read_csv(args.text, sep='|', names=['id', 'text', 'speaker_name'])
+        df = pd.read_csv(args.text, sep='|')
+        num_cols = df.shape[1]
+        columns = ['id', 'text', 'speaker_name', 'gender', 'text_len', 'audio_len'][:num_cols]
+        df = pd.read_csv(args.text, sep='|', names=columns)
+        df = df.head(10)
 
         # print(f'Number of examples before speaker filter: {len(df)}')
         # if args.speaker_name_filter:
@@ -370,7 +374,7 @@ If you don't specify any models, then it uses LJSpeech based English model.
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Synthesizing"):
             wav = synthesizer.tts(
                 row['text'],
-                args.speaker_idx,
+                row['speaker_name'] if not args.speaker_idx else args.speaker_idx,
                 args.language_idx,
                 args.speaker_wav,
                 reference_wav=args.reference_wav,
