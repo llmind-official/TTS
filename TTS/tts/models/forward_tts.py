@@ -255,7 +255,7 @@ class ForwardTTS(BaseTTS):
             self.num_speakers = self.speaker_manager.num_speakers
         # init d-vector embedding
         if config.use_d_vector_file:
-            self.embedded_speaker_dim = config.d_vector_dim
+            #self.embedded_speaker_dim = config.d_vector_dim
             if self.args.d_vector_dim != self.args.hidden_channels:
                 self.proj_g = nn.Conv1d(self.args.d_vector_dim, self.args.hidden_channels, 1)
         # init speaker embedding layer
