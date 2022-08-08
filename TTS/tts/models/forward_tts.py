@@ -107,6 +107,15 @@ class ForwardTTSArgs(Coqpit):
         d_vector_dim (int):
             Number of d-vector channels. Defaults to 0.
 
+        use_speaker_encoder_as_loss (bool):
+            Enable/Disable Speaker Consistency Loss (SCL). Defaults to False.
+
+        speaker_encoder_config_path (str):
+            Path to the file speaker encoder config file, to use for SCL. Defaults to "".
+
+        speaker_encoder_model_path (str):
+            Path to the file speaker encoder checkpoint file, to use for SCL. Defaults to "".
+
     """
 
     num_chars: int = None
@@ -140,6 +149,9 @@ class ForwardTTSArgs(Coqpit):
     use_d_vector_file: bool = False
     d_vector_dim: int = None
     d_vector_file: str = None
+    use_speaker_encoder_as_loss: bool = False
+    speaker_encoder_config_path: str = ""
+    speaker_encoder_model_path: str = ""
 
 
 class ForwardTTS(BaseTTS):
@@ -264,6 +276,22 @@ class ForwardTTS(BaseTTS):
             self.emb_g = nn.Embedding(self.num_speakers, self.args.hidden_channels)
             nn.init.uniform_(self.emb_g.weight, -0.1, 0.1)
 
+        if self.args.use_speaker_encoder_as_loss:
+            if self.speaker_manager.encoder is None and (
+                not self.args.speaker_encoder_model_path or not self.args.speaker_encoder_config_path
+            ):
+                raise RuntimeError(
+                    " [!] To use the speaker consistency loss (SCL) you need to specify speaker_encoder_model_path and speaker_encoder_config_path !!"
+                )
+
+            self.speaker_manager.encoder.eval()
+            print(" > External Speaker Encoder Loaded !!")
+            # as we are loading spectograms directly
+            self.speaker_manager.encoder.use_torch_spec = False
+            print(" > External Speaker Encoder use_torch_spec is set to False !!")
+            if self.args.out_channels != self.speaker_manager.encoder.input_dim:
+                self.pre_speaker_encoder = nn.Conv1d(self.args.out_channels, self.speaker_manager.encoder.input_dim, 1)
+
     @staticmethod
     def generate_attn(dr, x_mask, y_mask=None):
         """Generate an attention mask from the durations.
@@ -354,17 +382,16 @@ class ForwardTTS(BaseTTS):
             - g: :math:`(B, C)`
         """
         if hasattr(self, "emb_g"):
-            g = self.emb_g(g)  # [B, C, 1]
+            g = self.emb_g(g)  # [] -> [C] for single input; [B] -> [B, C]
         if g is not None:
-            g = g.unsqueeze(-1)
-        # [B, T, C]
-        x_emb = self.emb(x)
+            g = g.unsqueeze(-1) # [C] -> [C, 1] for single input; [B, C] -> [B, C, 1]
+        x_emb = self.emb(x) # [T] -> [T, C] for single input; [B, T] ->  [B, T, C]
         # encoder pass
-        o_en = self.encoder(torch.transpose(x_emb, 1, -1), x_mask)
+        o_en = self.encoder(torch.transpose(x_emb, 1, -1), x_mask) # [C, T] for single input; [B, C, T]
         # speaker conditioning
         # TODO: try different ways of conditioning
         if g is not None:
-            o_en = o_en + g
+            o_en = o_en + g # [C, T] for single input; [B, C, T]
         return o_en, x_mask, g, x_emb
 
     def _forward_decoder(
@@ -559,6 +586,21 @@ class ForwardTTS(BaseTTS):
         o_de, attn = self._forward_decoder(
             o_en, dr, x_mask, y_lengths, g=None
         )  # TODO: maybe pass speaker embedding (g) too
+
+        if self.args.use_speaker_encoder_as_loss and self.speaker_manager.encoder is not None:
+            # concate generated and GT waveforms
+            specs_batch = torch.cat((y, o_de), dim=0)
+            specs_batch = specs_batch.transpose(1, 2) # swapping time and freq dimensions # [B, F, T]
+            if self.pre_speaker_encoder: # specs_batch.size(1) != self.speaker_manager.encoder.input_dim:
+                specs_batch = self.pre_speaker_encoder(specs_batch)
+            specs_batch = torch.nn.functional.relu(specs_batch)
+            pred_embs = self.speaker_manager.encoder.forward(specs_batch, l2_norm=True)
+
+            # split generated and GT speaker embeddings
+            gt_spk_emb, syn_spk_emb = torch.chunk(pred_embs, 2, dim=0)
+        else:
+            gt_spk_emb, syn_spk_emb = None, None
+
         outputs = {
             "model_outputs": o_de,  # [B, T, C]
             "durations_log": o_dr_log.squeeze(1),  # [B, T]
@@ -573,6 +615,8 @@ class ForwardTTS(BaseTTS):
             "alignment_logprob": alignment_logprob,
             "x_mask": x_mask,
             "y_mask": y_mask,
+            "gt_spk_emb": gt_spk_emb,
+            "syn_spk_emb": syn_spk_emb,
         }
         return outputs
 
@@ -661,6 +705,7 @@ class ForwardTTS(BaseTTS):
         durations = batch["durations"]
         aux_input = {"d_vectors": d_vectors, "speaker_ids": speaker_ids}
 
+
         # forward pass
         outputs = self.forward(
             text_input, text_lengths, mel_lengths, y=mel_input, dr=durations, pitch=pitch, aux_input=aux_input
@@ -684,6 +729,9 @@ class ForwardTTS(BaseTTS):
                 alignment_soft=outputs["alignment_soft"],
                 alignment_hard=outputs["alignment_mas"],
                 binary_loss_weight=self.binary_loss_weight,
+                use_speaker_encoder_as_loss=self.args.use_speaker_encoder_as_loss,
+                gt_spk_emb=outputs['gt_spk_emb'],
+                syn_spk_emb=outputs['syn_spk_emb'],
             )
             # compute duration error
             durations_pred = outputs["durations"]
@@ -775,4 +823,10 @@ class ForwardTTS(BaseTTS):
         ap = AudioProcessor.init_from_config(config)
         tokenizer, new_config = TTSTokenizer.init_from_config(config)
         speaker_manager = SpeakerManager.init_from_config(config, samples)
+        if config.model_args.speaker_encoder_model_path: # use_speaker_encoder_as_loss
+            speaker_manager.init_encoder(
+                config.model_args.speaker_encoder_model_path, config.model_args.speaker_encoder_config_path
+            )
+            # as we are loading spectograms directly
+            speaker_manager.encoder.use_torch_spec = False
         return ForwardTTS(new_config, ap, tokenizer, speaker_manager)

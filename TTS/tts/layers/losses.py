@@ -777,6 +777,7 @@ class ForwardTTSLoss(nn.Module):
         self.spec_loss_alpha = c.spec_loss_alpha
         self.dur_loss_alpha = c.dur_loss_alpha
         self.binary_alignment_loss_alpha = c.binary_align_loss_alpha
+        self.spk_encoder_loss_alpha = c.spk_encoder_loss_alpha
 
     @staticmethod
     def _binary_alignment_loss(alignment_hard, alignment_soft):
@@ -785,6 +786,10 @@ class ForwardTTSLoss(nn.Module):
         """
         log_sum = torch.log(torch.clamp(alignment_soft[alignment_hard == 1], min=1e-12)).sum()
         return -log_sum / alignment_hard.sum()
+
+    @staticmethod
+    def cosine_similarity_loss(gt_spk_emb, syn_spk_emb):
+        return -torch.nn.functional.cosine_similarity(gt_spk_emb, syn_spk_emb).mean()
 
     def forward(
         self,
@@ -800,6 +805,9 @@ class ForwardTTSLoss(nn.Module):
         alignment_hard=None,
         alignment_soft=None,
         binary_loss_weight=None,
+        use_speaker_encoder_as_loss=False,
+        gt_spk_emb=None,
+        syn_spk_emb=None
     ):
         loss = 0
         return_dict = {}
@@ -838,6 +846,12 @@ class ForwardTTSLoss(nn.Module):
                 )
             else:
                 return_dict["loss_binary_alignment"] = self.binary_alignment_loss_alpha * binary_alignment_loss
+
+
+        if use_speaker_encoder_as_loss:
+            loss_se = self.cosine_similarity_loss(gt_spk_emb, syn_spk_emb) * self.spk_encoder_loss_alpha
+            loss = loss + loss_se
+            return_dict["loss_spk_encoder"] = loss_se
 
         return_dict["loss"] = loss
         return return_dict
