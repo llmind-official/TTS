@@ -7,16 +7,19 @@ from coqpit import Coqpit
 from torch import nn
 from torch.cuda.amp.autocast_mode import autocast
 
+from TTS.config import load_config
 from TTS.tts.layers.feed_forward.decoder import Decoder
 from TTS.tts.layers.feed_forward.encoder import Encoder
 from TTS.tts.layers.generic.aligner import AlignmentNetwork
 from TTS.tts.layers.generic.pos_encoding import PositionalEncoding
 from TTS.tts.layers.glow_tts.duration_predictor import DurationPredictor
 from TTS.tts.models.base_tts import BaseTTS
+from TTS.utils.audio import AudioProcessor
 from TTS.tts.utils.helpers import average_over_durations, generate_path, maximum_path, sequence_mask
 from TTS.tts.utils.speakers import SpeakerManager
 from TTS.tts.utils.text.tokenizer import TTSTokenizer
 from TTS.tts.utils.visual import plot_alignment, plot_avg_pitch, plot_spectrogram
+from TTS.vocoder.models import setup_model as setup_vocoder_model
 
 
 @dataclass
@@ -153,6 +156,9 @@ class ForwardTTSArgs(Coqpit):
     use_speaker_encoder_as_loss: bool = False
     speaker_encoder_config_path: str = ""
     speaker_encoder_model_path: str = ""
+    # external vocoder for speaker encoder loss
+    vocoder_path: str = None
+    vocoder_config_path: str = None
 
 
 class ForwardTTS(BaseTTS):
@@ -250,6 +256,15 @@ class ForwardTTS(BaseTTS):
             self.aligner = AlignmentNetwork(
                 in_query_channels=self.args.out_channels, in_key_channels=self.args.hidden_channels
             )
+
+        if self.args.vocoder_path and self.args.vocoder_config_path:
+            self.vocoder_config = load_config(self.args.vocoder_config_path)
+            self.vocoder_ap = AudioProcessor(verbose=False, **self.vocoder_config.audio)
+            self.vocoder_model = setup_vocoder_model(self.vocoder_config)
+            self.vocoder_model.load_checkpoint(self.vocoder_config, self.args.vocoder_path, eval=False)
+            self.vocoder_model.cuda()
+            print("> Vocoder loaded for speaker_encoder_loss")
+
 
     def init_multispeaker(self, config: Coqpit):
         """Init for multi-speaker training.
@@ -597,8 +612,11 @@ class ForwardTTS(BaseTTS):
         )  # TODO: maybe pass speaker embedding (g) too
 
         if self.args.use_speaker_encoder_as_loss and self.speaker_manager.encoder is not None: 
+            # ensure tss config and vocoder config are same
+            waveform_pred = self.vocoder_model.forward(o_de.transpose(1, 2))
+
             # concate generated and GT waveforms
-            wavs_batch = torch.cat((waveform.squeeze(), waveform.squeeze()), dim=0)
+            wavs_batch = torch.cat((waveform.squeeze(dim=2), waveform_pred.squeeze(dim=1)), dim=0)
 
             # resample audio to speaker encoder sample_rate
             # pylint: disable=W0105
@@ -848,3 +866,4 @@ class ForwardTTS(BaseTTS):
             # as we are loading spectograms directly
             speaker_manager.encoder.use_torch_spec = False
         return ForwardTTS(new_config, ap, tokenizer, speaker_manager)
+        
