@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
 
 import torch
+import torchaudio
 from coqpit import Coqpit
 from torch import nn
 from torch.cuda.amp.autocast_mode import autocast
@@ -286,11 +287,18 @@ class ForwardTTS(BaseTTS):
 
             self.speaker_manager.encoder.eval()
             print(" > External Speaker Encoder Loaded !!")
+
+            # pylint: disable=W0101,W0105
+            self.audio_transform = torchaudio.transforms.Resample(
+                orig_freq=self.config.audio.sample_rate,
+                new_freq=self.speaker_manager.encoder.audio_config["sample_rate"],
+            )
+
             # as we are loading spectograms directly
-            self.speaker_manager.encoder.use_torch_spec = False
-            print(" > External Speaker Encoder use_torch_spec is set to False !!")
-            if self.args.out_channels != self.speaker_manager.encoder.input_dim:
-                self.pre_speaker_encoder = nn.Conv1d(self.args.out_channels, self.speaker_manager.encoder.input_dim, 1)
+            # self.speaker_manager.encoder.use_torch_spec = False
+            # print(" > External Speaker Encoder use_torch_spec is set to False !!")
+            # if self.args.out_channels != self.speaker_manager.encoder.input_dim:
+            #     self.pre_speaker_encoder = nn.Conv1d(self.args.out_channels, self.speaker_manager.encoder.input_dim, 1)
 
     @staticmethod
     def generate_attn(dr, x_mask, y_mask=None):
@@ -529,6 +537,7 @@ class ForwardTTS(BaseTTS):
         dr: torch.IntTensor = None,
         pitch: torch.FloatTensor = None,
         aux_input: Dict = {"d_vectors": None, "speaker_ids": None},  # pylint: disable=unused-argument
+        waveform: torch.tensor = None,
     ) -> Dict:
         """Model's forward pass.
 
@@ -587,14 +596,22 @@ class ForwardTTS(BaseTTS):
             o_en, dr, x_mask, y_lengths, g=None
         )  # TODO: maybe pass speaker embedding (g) too
 
-        if self.args.use_speaker_encoder_as_loss and self.speaker_manager.encoder is not None:
+        if self.args.use_speaker_encoder_as_loss and self.speaker_manager.encoder is not None: 
             # concate generated and GT waveforms
-            specs_batch = torch.cat((y, o_de), dim=0)
-            specs_batch = specs_batch.transpose(1, 2) # swapping time and freq dimensions # [B, F, T]
-            if self.pre_speaker_encoder: # specs_batch.size(1) != self.speaker_manager.encoder.input_dim:
-                specs_batch = self.pre_speaker_encoder(specs_batch)
-            specs_batch = torch.nn.functional.relu(specs_batch)
-            pred_embs = self.speaker_manager.encoder.forward(specs_batch, l2_norm=True)
+            wavs_batch = torch.cat((waveform.squeeze(), waveform.squeeze()), dim=0)
+
+            # resample audio to speaker encoder sample_rate
+            # pylint: disable=W0105
+            if self.audio_transform is not None:
+                wavs_batch = self.audio_transform(wavs_batch)
+            pred_embs = self.speaker_manager.encoder.forward(wavs_batch.float(), l2_norm=True)
+
+            # specs_batch = torch.cat((y, o_de), dim=0)
+            # specs_batch = specs_batch.transpose(1, 2) # swapping time and freq dimensions # [B, F, T]
+            # if self.pre_speaker_encoder: # specs_batch.size(1) != self.speaker_manager.encoder.input_dim:
+            #     specs_batch = self.pre_speaker_encoder(specs_batch)
+            # specs_batch = torch.nn.functional.relu(specs_batch)
+            # pred_embs = self.speaker_manager.encoder.forward(specs_batch, l2_norm=True)
 
             # split generated and GT speaker embeddings
             gt_spk_emb, syn_spk_emb = torch.chunk(pred_embs, 2, dim=0)
@@ -699,6 +716,7 @@ class ForwardTTS(BaseTTS):
         text_lengths = batch["text_lengths"]
         mel_input = batch["mel_input"]
         mel_lengths = batch["mel_lengths"]
+        waveform = batch["waveform"]
         pitch = batch["pitch"] if self.args.use_pitch else None
         d_vectors = batch["d_vectors"]
         speaker_ids = batch["speaker_ids"]
@@ -708,7 +726,7 @@ class ForwardTTS(BaseTTS):
 
         # forward pass
         outputs = self.forward(
-            text_input, text_lengths, mel_lengths, y=mel_input, dr=durations, pitch=pitch, aux_input=aux_input
+            text_input, text_lengths, mel_lengths, y=mel_input, dr=durations, pitch=pitch, aux_input=aux_input, waveform=waveform
         )
         # use aligner's output as the duration target
         if self.use_aligner:
