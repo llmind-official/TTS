@@ -20,7 +20,7 @@ from TTS.tts.utils.speakers import SpeakerManager
 from TTS.tts.utils.text.tokenizer import TTSTokenizer
 from TTS.tts.utils.visual import plot_alignment, plot_avg_pitch, plot_spectrogram
 from TTS.vocoder.models import setup_model as setup_vocoder_model
-
+from trainer.trainer_utils import get_optimizer, get_scheduler
 
 @dataclass
 class ForwardTTSArgs(Coqpit):
@@ -866,4 +866,8 @@ class ForwardTTS(BaseTTS):
             # as we are loading spectograms directly
             speaker_manager.encoder.use_torch_spec = False
         return ForwardTTS(new_config, ap, tokenizer, speaker_manager)
-        
+
+    def get_optimizer(self):
+        parameters = (value for key, value in self.named_parameters() if not key.startswith('vocoder_model.'))
+        optimizer = get_optimizer(self.config.optimizer, self.config.optimizer_params, self.config.lr, parameters=parameters)
+        return optimizer
