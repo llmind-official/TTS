@@ -805,6 +805,7 @@ class ForwardTTSLoss(nn.Module):
         alignment_hard=None,
         alignment_soft=None,
         binary_loss_weight=None,
+        train_aligner=True,
         use_speaker_encoder_as_loss=False,
         gt_spk_emb=None,
         syn_spk_emb=None
@@ -832,20 +833,21 @@ class ForwardTTSLoss(nn.Module):
             loss = loss + self.pitch_loss_alpha * pitch_loss
             return_dict["loss_pitch"] = self.pitch_loss_alpha * pitch_loss
 
-        if hasattr(self, "aligner_loss") and self.aligner_loss_alpha > 0:
-            aligner_loss = self.aligner_loss(alignment_logprob, input_lens, decoder_output_lens)
-            loss = loss + self.aligner_loss_alpha * aligner_loss
-            return_dict["loss_aligner"] = self.aligner_loss_alpha * aligner_loss
+        if train_aligner:
+            if hasattr(self, "aligner_loss") and self.aligner_loss_alpha > 0:
+                aligner_loss = self.aligner_loss(alignment_logprob, input_lens, decoder_output_lens)
+                loss = loss + self.aligner_loss_alpha * aligner_loss
+                return_dict["loss_aligner"] = self.aligner_loss_alpha * aligner_loss
 
-        if self.binary_alignment_loss_alpha > 0 and alignment_hard is not None:
-            binary_alignment_loss = self._binary_alignment_loss(alignment_hard, alignment_soft)
-            loss = loss + self.binary_alignment_loss_alpha * binary_alignment_loss
-            if binary_loss_weight:
-                return_dict["loss_binary_alignment"] = (
-                    self.binary_alignment_loss_alpha * binary_alignment_loss * binary_loss_weight
-                )
-            else:
-                return_dict["loss_binary_alignment"] = self.binary_alignment_loss_alpha * binary_alignment_loss
+            if self.binary_alignment_loss_alpha > 0 and alignment_hard is not None:
+                binary_alignment_loss = self._binary_alignment_loss(alignment_hard, alignment_soft)
+                loss = loss + self.binary_alignment_loss_alpha * binary_alignment_loss
+                if binary_loss_weight:
+                    return_dict["loss_binary_alignment"] = (
+                        self.binary_alignment_loss_alpha * binary_alignment_loss * binary_loss_weight
+                    )
+                else:
+                    return_dict["loss_binary_alignment"] = self.binary_alignment_loss_alpha * binary_alignment_loss
 
 
         if use_speaker_encoder_as_loss:

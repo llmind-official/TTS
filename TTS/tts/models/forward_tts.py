@@ -206,6 +206,7 @@ class ForwardTTS(BaseTTS):
         self.use_aligner = self.args.use_aligner
         self.use_pitch = self.args.use_pitch
         self.binary_loss_weight = 0.0
+        self.train_aligner = True
 
         self.length_scale = (
             float(self.args.length_scale) if isinstance(self.args.length_scale, int) else self.args.length_scale
@@ -765,6 +766,7 @@ class ForwardTTS(BaseTTS):
                 alignment_soft=outputs["alignment_soft"],
                 alignment_hard=outputs["alignment_mas"],
                 binary_loss_weight=self.binary_loss_weight,
+                train_aligner=self.train_aligner,
                 use_speaker_encoder_as_loss=self.args.use_speaker_encoder_as_loss,
                 gt_spk_emb=outputs['gt_spk_emb'],
                 syn_spk_emb=outputs['syn_spk_emb'],
@@ -844,6 +846,8 @@ class ForwardTTS(BaseTTS):
     def on_train_step_start(self, trainer):
         """Schedule binary loss weight."""
         self.binary_loss_weight = min(trainer.epochs_done / self.config.binary_loss_warmup_epochs, 1.0) * 1.0
+        if trainer.epochs_done >= self.config.aligner_epochs:
+            self.train_aligner = False
 
     @staticmethod
     def init_from_config(config: "ForwardTTSConfig", samples: Union[List[List], List[Dict]] = None):
