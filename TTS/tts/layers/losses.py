@@ -812,7 +812,7 @@ class ForwardTTSLoss(nn.Module):
     ):
         loss = 0
         return_dict = {}
-        if hasattr(self, "ssim_loss") and self.ssim_loss_alpha > 0:
+        if hasattr(self, "ssim") and self.ssim_loss_alpha > 0:
             ssim_loss = self.ssim(decoder_output, decoder_target, decoder_output_lens)
             loss = loss + self.ssim_loss_alpha * ssim_loss
             return_dict["loss_ssim"] = self.ssim_loss_alpha * ssim_loss
