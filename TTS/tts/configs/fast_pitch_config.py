@@ -108,6 +108,10 @@ class FastPitchConfig(BaseTTSConfig):
     # model specific params
     model_args: ForwardTTSArgs = ForwardTTSArgs()
 
+    # data loader params
+    return_wav: bool = False
+    compute_linear_spec: bool = False
+
     # multi-speaker settings
     num_speakers: int = 0
     speakers_file: str = None
@@ -134,7 +138,9 @@ class FastPitchConfig(BaseTTSConfig):
     pitch_loss_alpha: float = 0.1
     dur_loss_alpha: float = 0.1
     binary_align_loss_alpha: float = 0.1
+    spk_encoder_loss_alpha: float = 0.1
     binary_loss_warmup_epochs: int = 150
+    aligner_epochs: int = 1000
 
     # overrides
     min_seq_len: int = 13

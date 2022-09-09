@@ -357,7 +357,11 @@ If you don't specify any models, then it uses LJSpeech based English model.
 
     # RUN THE SYNTHESIS
     if args.text.endswith('.csv'):
-        df = pd.read_csv(args.text, sep='|', names=['id', 'text', 'speaker_name'])
+        df = pd.read_csv(args.text, sep='|')
+        num_cols = df.shape[1]
+        columns = ['id', 'text', 'speaker_name', 'gender', 'text_len', 'audio_len', 'speaker_wav'][:num_cols]
+        df = pd.read_csv(args.text, sep='|', names=columns)
+        df = df.head(10)
 
         # print(f'Number of examples before speaker filter: {len(df)}')
         # if args.speaker_name_filter:
@@ -367,18 +371,32 @@ If you don't specify any models, then it uses LJSpeech based English model.
         if len(df) == 0:
             raise ValueError("No records found.")
 
-        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Synthesizing"):
-            wav = synthesizer.tts(
-                row['text'],
-                args.speaker_idx,
-                args.language_idx,
-                args.speaker_wav,
-                reference_wav=args.reference_wav,
-                style_wav=args.capacitron_style_wav,
-                style_text=args.capacitron_style_text,
-                reference_speaker_name=args.reference_speaker_idx,
-            )
-            synthesizer.save_wav(wav, f'{args.out_path}/{row["id"]}.wav')
+        if 'speaker_wav' in df.columns:
+            for idx, row in tqdm(df.iterrows(), total=len(df), desc="Synthesizing"):
+                wav = synthesizer.tts(
+                    text=row['text'],
+                    speaker_name=None,
+                    language_name=args.language_idx,
+                    speaker_wav=row['speaker_wav'],
+                    reference_wav=args.reference_wav,
+                    style_wav=args.capacitron_style_wav,
+                    style_text=args.capacitron_style_text,
+                    reference_speaker_name=args.reference_speaker_idx,
+                )
+                synthesizer.save_wav(wav, f'{args.out_path}/{row["id"]}.wav')
+        else:
+            for idx, row in tqdm(df.iterrows(), total=len(df), desc="Synthesizing"):
+                wav = synthesizer.tts(
+                    row['text'],
+                    row['speaker_name'] if 'speaker_name' in df.columns else args.speaker_idx,
+                    args.language_idx,
+                    args.speaker_wav,
+                    reference_wav=args.reference_wav,
+                    style_wav=args.capacitron_style_wav,
+                    style_text=args.capacitron_style_text,
+                    reference_speaker_name=args.reference_speaker_idx,
+                )
+                synthesizer.save_wav(wav, f'{args.out_path}/{row["id"]}.wav')
         print(" > Saved output wav files in {}".format(args.out_path))
         return True
 

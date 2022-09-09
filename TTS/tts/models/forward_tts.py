@@ -2,21 +2,25 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
 
 import torch
+import torchaudio
 from coqpit import Coqpit
 from torch import nn
 from torch.cuda.amp.autocast_mode import autocast
 
+from TTS.config import load_config
 from TTS.tts.layers.feed_forward.decoder import Decoder
 from TTS.tts.layers.feed_forward.encoder import Encoder
 from TTS.tts.layers.generic.aligner import AlignmentNetwork
 from TTS.tts.layers.generic.pos_encoding import PositionalEncoding
 from TTS.tts.layers.glow_tts.duration_predictor import DurationPredictor
 from TTS.tts.models.base_tts import BaseTTS
+from TTS.utils.audio import AudioProcessor
 from TTS.tts.utils.helpers import average_over_durations, generate_path, maximum_path, sequence_mask
 from TTS.tts.utils.speakers import SpeakerManager
 from TTS.tts.utils.text.tokenizer import TTSTokenizer
 from TTS.tts.utils.visual import plot_alignment, plot_avg_pitch, plot_spectrogram
-
+from TTS.vocoder.models import setup_model as setup_vocoder_model
+from trainer.trainer_utils import get_optimizer, get_scheduler
 
 @dataclass
 class ForwardTTSArgs(Coqpit):
@@ -107,6 +111,15 @@ class ForwardTTSArgs(Coqpit):
         d_vector_dim (int):
             Number of d-vector channels. Defaults to 0.
 
+        use_speaker_encoder_as_loss (bool):
+            Enable/Disable Speaker Consistency Loss (SCL). Defaults to False.
+
+        speaker_encoder_config_path (str):
+            Path to the file speaker encoder config file, to use for SCL. Defaults to "".
+
+        speaker_encoder_model_path (str):
+            Path to the file speaker encoder checkpoint file, to use for SCL. Defaults to "".
+
     """
 
     num_chars: int = None
@@ -140,6 +153,12 @@ class ForwardTTSArgs(Coqpit):
     use_d_vector_file: bool = False
     d_vector_dim: int = None
     d_vector_file: str = None
+    use_speaker_encoder_as_loss: bool = False
+    speaker_encoder_config_path: str = ""
+    speaker_encoder_model_path: str = ""
+    # external vocoder for speaker encoder loss
+    vocoder_path: str = None
+    vocoder_config_path: str = None
 
 
 class ForwardTTS(BaseTTS):
@@ -187,6 +206,7 @@ class ForwardTTS(BaseTTS):
         self.use_aligner = self.args.use_aligner
         self.use_pitch = self.args.use_pitch
         self.binary_loss_weight = 0.0
+        self.train_aligner = True
 
         self.length_scale = (
             float(self.args.length_scale) if isinstance(self.args.length_scale, int) else self.args.length_scale
@@ -238,6 +258,15 @@ class ForwardTTS(BaseTTS):
                 in_query_channels=self.args.out_channels, in_key_channels=self.args.hidden_channels
             )
 
+        if self.args.vocoder_path and self.args.vocoder_config_path:
+            self.vocoder_config = load_config(self.args.vocoder_config_path)
+            self.vocoder_ap = AudioProcessor(verbose=False, **self.vocoder_config.audio)
+            self.vocoder_model = setup_vocoder_model(self.vocoder_config)
+            self.vocoder_model.load_checkpoint(self.vocoder_config, self.args.vocoder_path, eval=False)
+            self.vocoder_model.cuda()
+            print("> Vocoder loaded for speaker_encoder_loss")
+
+
     def init_multispeaker(self, config: Coqpit):
         """Init for multi-speaker training.
 
@@ -255,7 +284,7 @@ class ForwardTTS(BaseTTS):
             self.num_speakers = self.speaker_manager.num_speakers
         # init d-vector embedding
         if config.use_d_vector_file:
-            self.embedded_speaker_dim = config.d_vector_dim
+            #self.embedded_speaker_dim = config.d_vector_dim
             if self.args.d_vector_dim != self.args.hidden_channels:
                 self.proj_g = nn.Conv1d(self.args.d_vector_dim, self.args.hidden_channels, 1)
         # init speaker embedding layer
@@ -263,6 +292,29 @@ class ForwardTTS(BaseTTS):
             print(" > Init speaker_embedding layer.")
             self.emb_g = nn.Embedding(self.num_speakers, self.args.hidden_channels)
             nn.init.uniform_(self.emb_g.weight, -0.1, 0.1)
+
+        if self.args.use_speaker_encoder_as_loss:
+            if self.speaker_manager.encoder is None and (
+                not self.args.speaker_encoder_model_path or not self.args.speaker_encoder_config_path
+            ):
+                raise RuntimeError(
+                    " [!] To use the speaker consistency loss (SCL) you need to specify speaker_encoder_model_path and speaker_encoder_config_path !!"
+                )
+
+            self.speaker_manager.encoder.eval()
+            print(" > External Speaker Encoder Loaded !!")
+
+            # pylint: disable=W0101,W0105
+            self.audio_transform = torchaudio.transforms.Resample(
+                orig_freq=self.config.audio.sample_rate,
+                new_freq=self.speaker_manager.encoder.audio_config["sample_rate"],
+            )
+
+            # as we are loading spectograms directly
+            # self.speaker_manager.encoder.use_torch_spec = False
+            # print(" > External Speaker Encoder use_torch_spec is set to False !!")
+            # if self.args.out_channels != self.speaker_manager.encoder.input_dim:
+            #     self.pre_speaker_encoder = nn.Conv1d(self.args.out_channels, self.speaker_manager.encoder.input_dim, 1)
 
     @staticmethod
     def generate_attn(dr, x_mask, y_mask=None):
@@ -354,17 +406,16 @@ class ForwardTTS(BaseTTS):
             - g: :math:`(B, C)`
         """
         if hasattr(self, "emb_g"):
-            g = self.emb_g(g)  # [B, C, 1]
+            g = self.emb_g(g)  # [] -> [C] for single input; [B] -> [B, C]
         if g is not None:
-            g = g.unsqueeze(-1)
-        # [B, T, C]
-        x_emb = self.emb(x)
+            g = g.unsqueeze(-1) # [C] -> [C, 1] for single input; [B, C] -> [B, C, 1]
+        x_emb = self.emb(x) # [T] -> [T, C] for single input; [B, T] ->  [B, T, C]
         # encoder pass
-        o_en = self.encoder(torch.transpose(x_emb, 1, -1), x_mask)
+        o_en = self.encoder(torch.transpose(x_emb, 1, -1), x_mask) # [C, T] for single input; [B, C, T]
         # speaker conditioning
         # TODO: try different ways of conditioning
         if g is not None:
-            o_en = o_en + g
+            o_en = o_en + g # [C, T] for single input; [B, C, T]
         return o_en, x_mask, g, x_emb
 
     def _forward_decoder(
@@ -502,6 +553,7 @@ class ForwardTTS(BaseTTS):
         dr: torch.IntTensor = None,
         pitch: torch.FloatTensor = None,
         aux_input: Dict = {"d_vectors": None, "speaker_ids": None},  # pylint: disable=unused-argument
+        waveform: torch.tensor = None,
     ) -> Dict:
         """Model's forward pass.
 
@@ -559,6 +611,32 @@ class ForwardTTS(BaseTTS):
         o_de, attn = self._forward_decoder(
             o_en, dr, x_mask, y_lengths, g=None
         )  # TODO: maybe pass speaker embedding (g) too
+
+        if self.args.use_speaker_encoder_as_loss and self.speaker_manager.encoder is not None: 
+            # ensure tss config and vocoder config are same
+            waveform_pred = self.vocoder_model.forward(o_de.transpose(1, 2))
+
+            # concate generated and GT waveforms
+            wavs_batch = torch.cat((waveform.squeeze(dim=2), waveform_pred.squeeze(dim=1)), dim=0)
+
+            # resample audio to speaker encoder sample_rate
+            # pylint: disable=W0105
+            if self.audio_transform is not None:
+                wavs_batch = self.audio_transform(wavs_batch)
+            pred_embs = self.speaker_manager.encoder.forward(wavs_batch.float(), l2_norm=True)
+
+            # specs_batch = torch.cat((y, o_de), dim=0)
+            # specs_batch = specs_batch.transpose(1, 2) # swapping time and freq dimensions # [B, F, T]
+            # if self.pre_speaker_encoder: # specs_batch.size(1) != self.speaker_manager.encoder.input_dim:
+            #     specs_batch = self.pre_speaker_encoder(specs_batch)
+            # specs_batch = torch.nn.functional.relu(specs_batch)
+            # pred_embs = self.speaker_manager.encoder.forward(specs_batch, l2_norm=True)
+
+            # split generated and GT speaker embeddings
+            gt_spk_emb, syn_spk_emb = torch.chunk(pred_embs, 2, dim=0)
+        else:
+            gt_spk_emb, syn_spk_emb = None, None
+
         outputs = {
             "model_outputs": o_de,  # [B, T, C]
             "durations_log": o_dr_log.squeeze(1),  # [B, T]
@@ -573,6 +651,8 @@ class ForwardTTS(BaseTTS):
             "alignment_logprob": alignment_logprob,
             "x_mask": x_mask,
             "y_mask": y_mask,
+            "gt_spk_emb": gt_spk_emb,
+            "syn_spk_emb": syn_spk_emb,
         }
         return outputs
 
@@ -613,20 +693,59 @@ class ForwardTTS(BaseTTS):
         }
         return outputs
 
+    @torch.no_grad()
+    def inference2(self, x, x_lengths, aux_input={"d_vectors": None, "speaker_ids": None}):  # pylint: disable=unused-argument
+        """Model's inference pass.
+
+        Args:
+            x (torch.LongTensor): Input character sequence.
+            aux_input (Dict): Auxiliary model inputs. Defaults to `{"d_vectors": None, "speaker_ids": None}`.
+
+        Shapes:
+            - x: [B, T_max]
+            - x_lengths: [B]
+            - g: [B, C]
+        """
+        g = self._set_speaker_input(aux_input)
+        #x_lengths = torch.tensor(x.shape[1:2]).to(x.device)
+        x_mask = torch.unsqueeze(sequence_mask(x_lengths, x.shape[1]), 1).to(x.dtype).float()
+        # encoder pass
+        o_en, x_mask, g, _ = self._forward_encoder(x, x_mask, g)
+        # duration predictor pass
+        o_dr_log = self.duration_predictor(o_en, x_mask)
+        o_dr = self.format_durations(o_dr_log, x_mask).squeeze(1)
+        y_lengths = o_dr.sum(1)
+        # pitch predictor pass
+        o_pitch = None
+        if self.args.use_pitch:
+            o_pitch_emb, o_pitch = self._forward_pitch_predictor(o_en, x_mask)
+            o_en = o_en + o_pitch_emb
+        # decoder pass
+        o_de, attn = self._forward_decoder(o_en, o_dr, x_mask, y_lengths, g=None)
+        outputs = {
+            "model_outputs": o_de,
+            "alignments": attn,
+            "pitch": o_pitch,
+            "durations_log": o_dr_log,
+        }
+        return outputs
+
     def train_step(self, batch: dict, criterion: nn.Module):
         text_input = batch["text_input"]
         text_lengths = batch["text_lengths"]
         mel_input = batch["mel_input"]
         mel_lengths = batch["mel_lengths"]
+        waveform = batch["waveform"]
         pitch = batch["pitch"] if self.args.use_pitch else None
         d_vectors = batch["d_vectors"]
         speaker_ids = batch["speaker_ids"]
         durations = batch["durations"]
         aux_input = {"d_vectors": d_vectors, "speaker_ids": speaker_ids}
 
+
         # forward pass
         outputs = self.forward(
-            text_input, text_lengths, mel_lengths, y=mel_input, dr=durations, pitch=pitch, aux_input=aux_input
+            text_input, text_lengths, mel_lengths, y=mel_input, dr=durations, pitch=pitch, aux_input=aux_input, waveform=waveform
         )
         # use aligner's output as the duration target
         if self.use_aligner:
@@ -647,6 +766,10 @@ class ForwardTTS(BaseTTS):
                 alignment_soft=outputs["alignment_soft"],
                 alignment_hard=outputs["alignment_mas"],
                 binary_loss_weight=self.binary_loss_weight,
+                train_aligner=self.train_aligner,
+                use_speaker_encoder_as_loss=self.args.use_speaker_encoder_as_loss,
+                gt_spk_emb=outputs['gt_spk_emb'],
+                syn_spk_emb=outputs['syn_spk_emb'],
             )
             # compute duration error
             durations_pred = outputs["durations"]
@@ -723,6 +846,8 @@ class ForwardTTS(BaseTTS):
     def on_train_step_start(self, trainer):
         """Schedule binary loss weight."""
         self.binary_loss_weight = min(trainer.epochs_done / self.config.binary_loss_warmup_epochs, 1.0) * 1.0
+        if trainer.epochs_done >= self.config.aligner_epochs:
+            self.train_aligner = False
 
     @staticmethod
     def init_from_config(config: "ForwardTTSConfig", samples: Union[List[List], List[Dict]] = None):
@@ -738,4 +863,15 @@ class ForwardTTS(BaseTTS):
         ap = AudioProcessor.init_from_config(config)
         tokenizer, new_config = TTSTokenizer.init_from_config(config)
         speaker_manager = SpeakerManager.init_from_config(config, samples)
+        if config.model_args.speaker_encoder_model_path: # use_speaker_encoder_as_loss
+            speaker_manager.init_encoder(
+                config.model_args.speaker_encoder_model_path, config.model_args.speaker_encoder_config_path
+            )
+            # as we are loading spectograms directly
+            speaker_manager.encoder.use_torch_spec = False
         return ForwardTTS(new_config, ap, tokenizer, speaker_manager)
+
+    def get_optimizer(self):
+        parameters = (value for key, value in self.named_parameters() if not key.startswith('vocoder_model.'))
+        optimizer = get_optimizer(self.config.optimizer, self.config.optimizer_params, self.config.lr, parameters=parameters)
+        return optimizer

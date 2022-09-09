@@ -6,6 +6,8 @@ import pysbd
 import torch
 
 from TTS.config import load_config
+from TTS.encoder.models.resnet import ResNetSpeakerEncoder
+from TTS.tts.configs.shared_configs import BaseAudioConfig
 from TTS.tts.models import setup_model as setup_tts_model
 
 # pylint: disable=unused-wildcard-import
@@ -119,8 +121,30 @@ class Synthesizer(object):
         if use_cuda:
             self.tts_model.cuda()
 
-        if self.encoder_checkpoint and hasattr(self.tts_model, "speaker_manager"):
+        self.use_zero_shot_speaker_encoder = False
+        if self.encoder_checkpoint and self.encoder_config and hasattr(self.tts_model, "speaker_manager"):
             self.tts_model.speaker_manager.init_encoder(self.encoder_checkpoint, self.encoder_config, use_cuda)
+        elif self.encoder_checkpoint and self.encoder_config is None:
+            self.use_zero_shot_speaker_encoder = True
+            del self.tts_model.emb_g
+            state_dict = torch.load(self.encoder_checkpoint)['state_dict']
+            state_dict = {k.split('.', 1)[1]:v for k,v in state_dict.items() if k.startswith('speaker_encoder')}
+            self.zero_shot_speaker_encoder = ResNetSpeakerEncoder(
+                input_dim=self.tts_config['model_args']['out_channels'],
+                proj_dim=self.tts_config['model_args']['hidden_channels'],
+                layers=[3, 4, 6, 3],
+                num_filters=[32, 64, 128, 256],
+                encoder_type="ASP",
+                log_input=False,
+                use_torch_spec=False,
+                audio_config=BaseAudioConfig(
+                    **self.tts_config['audio']
+                ),
+            )
+            self.zero_shot_speaker_encoder.load_state_dict(state_dict)
+            if use_cuda:
+                self.zero_shot_speaker_encoder.cuda()
+            print("| Loaded zero-shot speaker encoder.")
 
     def _set_speaker_encoder_paths_from_tts_config(self):
         """Set the encoder paths from the tts model config for models with speaker encoders."""
@@ -260,7 +284,14 @@ class Synthesizer(object):
 
         # compute a new d_vector from the given clip.
         if speaker_wav is not None:
-            speaker_embedding = self.tts_model.speaker_manager.compute_embedding_from_clip(speaker_wav)
+            if self.use_zero_shot_speaker_encoder:
+                wav = self.tts_model.ap.load_wav(speaker_wav, sr=22050)
+                mel = self.tts_model.ap.melspectrogram(wav).astype("float32")
+                mel = torch.FloatTensor(mel).contiguous().unsqueeze(0)
+                with torch.no_grad():
+                    speaker_embedding = self.zero_shot_speaker_encoder(mel)[0]
+            else:
+                speaker_embedding = self.tts_model.speaker_manager.compute_embedding_from_clip(speaker_wav)
 
         use_gl = self.vocoder_model is None
 
@@ -283,7 +314,23 @@ class Synthesizer(object):
                 mel_postnet_spec = outputs["outputs"]["model_outputs"][0].detach().cpu().numpy()
                 if not use_gl:
                     # denormalize tts output based on tts audio config
+                    # ###
+                    # import matplotlib.pyplot as plt
+                    # import seaborn as sns
+                    # img=sns.heatmap(mel_postnet_spec.T)
+                    # fig = img.get_figure()
+                    # fig.savefig('output/fp_1.png')
+                    # fig.clf()
+                    # ###
                     mel_postnet_spec = self.tts_model.ap.denormalize(mel_postnet_spec.T).T
+                    # ###
+                    # import matplotlib.pyplot as plt
+                    # import seaborn as sns
+                    # img=sns.heatmap(mel_postnet_spec.T)
+                    # fig = img.get_figure()
+                    # fig.savefig('output/fp_2.png')
+                    # fig.clf()
+                    # ###
                     device_type = "cuda" if self.use_cuda else "cpu"
                     # renormalize spectrogram based on vocoder config
                     vocoder_input = self.vocoder_ap.normalize(mel_postnet_spec.T)
