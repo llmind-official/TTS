@@ -159,6 +159,7 @@ class ForwardTTSArgs(Coqpit):
     # external vocoder for speaker encoder loss
     vocoder_path: str = None
     vocoder_config_path: str = None
+    use_separate_optimizers: bool = False
 
 
 class ForwardTTS(BaseTTS):
@@ -730,7 +731,7 @@ class ForwardTTS(BaseTTS):
         }
         return outputs
 
-    def train_step(self, batch: dict, criterion: nn.Module):
+    def train_step(self, batch: dict, criterion: nn.Module, optimizer_idx=None):
         text_input = batch["text_input"]
         text_lengths = batch["text_lengths"]
         mel_input = batch["mel_input"]
@@ -780,6 +781,8 @@ class ForwardTTS(BaseTTS):
 
     def _create_logs(self, batch, outputs, ap):
         """Create common logger outputs."""
+        if isinstance(outputs, list):
+            outputs = outputs[0]
         model_outputs = outputs["model_outputs"]
         alignments = outputs["alignments"]
         mel_input = batch["mel_input"]
@@ -821,7 +824,7 @@ class ForwardTTS(BaseTTS):
         logger.train_figures(steps, figures)
         logger.train_audios(steps, audios, self.ap.sample_rate)
 
-    def eval_step(self, batch: dict, criterion: nn.Module):
+    def eval_step(self, batch: dict, criterion: nn.Module, optimizer_idx=None):
         return self.train_step(batch, criterion)
 
     def eval_log(self, batch: dict, outputs: dict, logger: "Logger", assets: dict, steps: int) -> None:
@@ -872,6 +875,13 @@ class ForwardTTS(BaseTTS):
         return ForwardTTS(new_config, ap, tokenizer, speaker_manager)
 
     def get_optimizer(self):
-        parameters = (value for key, value in self.named_parameters() if not key.startswith('vocoder_model.'))
-        optimizer = get_optimizer(self.config.optimizer, self.config.optimizer_params, self.config.lr, parameters=parameters)
-        return optimizer
+        if self.args.use_separate_optimizers:
+            parameters = (value for key, value in self.named_parameters() if not key.startswith('vocoder_model.') and not key.startswith('aligner.'))
+            parameters_aligner = (value for key, value in self.named_parameters() if key.startswith('aligner.'))
+            optimizer = get_optimizer(self.config.optimizer, self.config.optimizer_params, self.config.lr, parameters=parameters)
+            optimizer_aligner = get_optimizer(self.config.optimizer, self.config.optimizer_params, self.config.lr, parameters=parameters_aligner)
+            return [optimizer, optimizer_aligner]
+        else:
+            parameters = (value for key, value in self.named_parameters() if not key.startswith('vocoder_model.'))
+            optimizer = get_optimizer(self.config.optimizer, self.config.optimizer_params, self.config.lr, parameters=parameters)
+            return optimizer
