@@ -236,6 +236,7 @@ class Synthesizer(object):
         # handle multi-speaker
         speaker_embedding = None
         speaker_id = None
+        speaker_name = "male" # HACK
         if self.tts_speakers_file or hasattr(self.tts_model.speaker_manager, "ids"):
             if speaker_name and isinstance(speaker_name, str):
                 if self.tts_config.use_d_vector_file:
